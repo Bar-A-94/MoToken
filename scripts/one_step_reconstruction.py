@@ -407,7 +407,6 @@ def get_language_bind_encodings(data_root, batch_size=100):
     encoding_list = []
     with torch.no_grad():
         for i in range(0, len(video_paths), batch_size):
-            gpu_status(f"Processing from video {i}")
             # Get the batch of video paths.
             batch_paths = video_paths[i: i + batch_size]
             # Process the current batch using the video modality transform and move it to GPU.
@@ -651,12 +650,13 @@ def main():
             embedding = torch.mul(embedding, avg_norm)
 
             top_words = [pipe.tokenizer.decode(dictionary_indices[sorted_indices[i]]) for i in range(print_words)]
-            print("top words: ", top_words)
-            print("alphas: ", alphas[sorted_indices[:print_words]])
+            for i in range(print_words):
+                token = top_words[i]
+                alpha = alphas[sorted_indices[i]]
+                print(f"{i}: {alpha} * {token}")
 
             token_embeds[placeholder_token_id] = embedding
             pipe.text_encoder.get_input_embeddings().weight.requires_grad_(True) # TODO: Why it's require grad? don't we need just the alpha?
-            gpu_status('After Net')
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect() 
@@ -678,7 +678,6 @@ def main():
             # Add noise to the latents according to the noise magnitude at each
             # timestep (this is the forward diffusion process)
             noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps).permute(0, 2, 1, 3, 4)
-            gpu_status('After Noise')
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect() 
@@ -693,7 +692,7 @@ def main():
             model_pred = pipe.transformer(noisy_latents, 
                                             encoder_hidden_states, 
                                             timesteps).sample.permute(0, 2, 1, 3, 4) 
-            gpu_status('After transformer')
+            gpu_status('After Transformer')
 
             # Get the target for loss depending on the prediction type
             # TODO: Understand what is this section
