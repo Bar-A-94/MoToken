@@ -1,0 +1,73 @@
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Dependency directories
+node_modules/
+jspm_packages/
+.venv/
+vendor/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Virtual environment
+venv/
+scripts/run/
+.venv/
+
+# Python
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+
+# IDE files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Git files
+*.orig
+
+
+
+# Ignore large files and common large file types
+*.mp4
+*.zip
+*.tar.gz
+*.iso
+*.exe
+*.safetensors  # Ignore large model files
+*.pt           # Ignore PyTorch model files
+
+# Exclude large specific directories or files if needed
+models/**/*.safetensors
+models/**/*.bin
+models/**/*.pt
+models/languagebindmodel/
+data/LB_text_encoding.pt
+
+# File structure documentation
+file_structure.txt
+.DS_Store
+
