@@ -126,7 +126,7 @@ def parse_args():
                         help="The concept to explain.",)
     parser.add_argument("--repeats",
                         type=int,
-                        default=100,
+                        default=5,
                         help="How many times to repeat the training data.",)
     parser.add_argument("--output_dir",
                         type=str,
@@ -317,7 +317,7 @@ class ConceptDataset(Dataset):
         self._length = self.num_videos
 
         if split == "train":
-            self._length = self.num_videos * repeats
+            self._length = self.num_videos * repeats #TODO: Check what used for
 
         self.interpolation = {"linear": PIL_INTERPOLATION["linear"],
                                 "bilinear": PIL_INTERPOLATION["bilinear"],
@@ -378,9 +378,8 @@ class ConceptDataset(Dataset):
         example["input_ids"] = self.tokenizer(text,
                                                 padding="max_length",
                                                 truncation=True,
-                                                max_length=self.tokenizer.model_max_length, # TODO: Ensure it's 226
+                                                max_length=self.tokenizer.model_max_length, 
                                                 return_tensors="pt",).input_ids[0]
-        print("TODO: Ensure it's 226", self.tokenizer.model_max_length)
         example["pixel_values"] = video_tensor
 
         return example
@@ -490,12 +489,6 @@ class Net(nn.Module):
 
 def main(): 
     args = parse_args()
-    logging_dir = os.path.join(args.output_dir, args.logging_dir) # TODO: Check if used
-
-    # Make one log on every process with the configuration for debugging.
-    logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-                        datefmt="%m/%d/%Y %H:%M:%S",
-                        level=logging.INFO,)
     transformers.utils.logging.set_verbosity_error()
     diffusers.utils.logging.set_verbosity_error()
     pipe = CogVideoXPipeline.from_pretrained(args.pretrained_model_name_or_path, 
@@ -642,7 +635,7 @@ def main():
 
     for epoch in range(args.num_train_epochs):
         net.train()
-        for batch_num, batch in enumerate(train_dataloader):
+        for batch_num, batch in tqdm(enumerate(train_dataloader), total=len(train_dataloader)):
             gpu_status('new batch!')
             pipe.text_encoder.get_input_embeddings().weight.detach_().requires_grad_(False)
 
@@ -754,7 +747,6 @@ def main():
                                 width=720,
                                 height=480,
                                 prompt=args.validation_prompt,  
-                                # prompt="A walking dog",
                                 num_videos_per_prompt=1,
                                 num_inference_steps=50,
                                 num_frames=81,
