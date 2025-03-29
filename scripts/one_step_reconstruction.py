@@ -83,11 +83,12 @@ logger = get_logger(__name__)
 template = ["A dog {}"]
 
 
-def gpu_status(stage):
-    print("GPUs status for:", stage)
-    for i in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(i)
-        print(f"Device {i}: {torch.cuda.get_device_name(i)} | Allocated: {torch.cuda.memory_allocated(i)/(1024**3):.2f}GB | Cached: {torch.cuda.memory_reserved(i)/(1024**3):.2f}GB | Total: {props.total_memory/(1024**3):.2f}GB")
+def gpu_status(stage, print_gpu_status=False):
+    if print_gpu_status:
+        print("GPUs status for:", stage)
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            print(f"Device {i}: {torch.cuda.get_device_name(i)} | Allocated: {torch.cuda.memory_allocated(i)/(1024**3):.2f}GB | Cached: {torch.cuda.memory_reserved(i)/(1024**3):.2f}GB | Total: {props.total_memory/(1024**3):.2f}GB")
 
 
 def parse_args():
@@ -156,7 +157,7 @@ def parse_args():
     parser.add_argument("--num_train_epochs", type=int, default=1000)
     parser.add_argument("--max_train_steps",
                         type=int,
-                        default=1000,
+                        default=10000,
                         help=("Total number of training steps to perform.  If provided, overrides"
                                 " num_train_epochs."),)
     parser.add_argument("--dictionary_size",
@@ -173,9 +174,13 @@ def parse_args():
                         help=("Number of updates steps to accumulate before performing a"
                                 " backward/update pass."),)
     parser.add_argument("--gradient_checkpointing",
-                        action="store_true", # TODO: Fix in code to use this
+                        action="store_true", 
                         help=("Whether or not to use gradient checkpointing to save memory at the"
                                 " expense of slower backward pass."),)
+    parser.add_argument("--print_gpu_status",
+                        type=bool, 
+                        default=False,
+                        help=("Whether or not to use print gpu status"),)
     parser.add_argument("--learning_rate",
                         type=float,
                         default=1e-3,
@@ -494,7 +499,8 @@ def main():
                                                 torch_dtype=torch.bfloat16, 
                                                 device_map="balanced")
     pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
-    pipe.transformer.enable_gradient_checkpointing()
+    if args.gradient_checkpointing:
+        pipe.transformer.enable_gradient_checkpointing()
 
     # Add the placeholder token in tokenizer
     num_added_tokens = pipe.tokenizer.add_tokens(args.placeholder_token)
@@ -554,7 +560,7 @@ def main():
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps) # TODO: Understand why it's needed
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps) 
   
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
@@ -635,6 +641,7 @@ def main():
     for epoch in range(args.num_train_epochs):
         net.train()
         for batch_num, batch in tqdm(enumerate(train_dataloader), total=len(train_dataloader)):
+            print(f"Epoch: {epoch} batch_num: {batch_num}")
             gpu_status('new batch!')
             pipe.text_encoder.get_input_embeddings().weight.detach_().requires_grad_(False)
 
@@ -723,7 +730,7 @@ def main():
             index_no_updates = torch.arange(len(pipe.tokenizer)) != placeholder_token_id
             with torch.no_grad():
                 pipe.text_encoder.get_input_embeddings().weight[index_no_updates] = orig_embeds_params[index_no_updates]
-            print(f"MSE Loss: {mse_loss}, Sparsity Loss: {sparsity_loss}")
+            print(f"Total loss: {loss.item()} = MSE Loss: {mse_loss}, {args.sparsity_coeff} * Sparsity Loss: {sparsity_loss.item()}")
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect() 
@@ -741,6 +748,23 @@ def main():
 
                 with torch.no_grad():
                     videos = []
+                    validation_dir = f"{args.output_dir}/validation/epoch_{epoch}"
+                    validation_dir = Path(validation_dir)
+                    validation_dir.mkdir(exist_ok=True, parents=True)
+                    video = pipe(
+                                width=720,
+                                height=480,
+                                prompt="A dog walking",  
+                                num_videos_per_prompt=1,
+                                num_inference_steps=50,
+                                num_frames=81,
+                                use_dynamic_cfg=True,
+                                guidance_scale=6.0,
+                                generator=generator
+                                ).frames[0]
+                    video_path = f"{validation_dir}/original.mp4"
+                    print(f"Video generated {video_path}")
+                    export_to_video(video, video_path, fps=16)
                     for i in range(args.num_validation_videos):
                         video = pipe(
                                 width=720,
@@ -753,11 +777,8 @@ def main():
                                 guidance_scale=6.0,
                                 generator=generator
                                 ).frames[0]
-                        validation_dir = f"{args.output_dir}/validation/{epoch}"
-                        validation_dir = Path(validation_dir)
-                        validation_dir.mkdir(exist_ok=True, parents=True)
                         video_path = f"{validation_dir}/{i}.mp4"
-                        print(f"Video generated {validation_dir}/{i}.mp4")
+                        print(f"Video generated {video_path}")
                         export_to_video(video, video_path, fps=16)
                         
                         probability = validation_model.get_probability(video_path, target_videos=validation_video_encodings[i : i + 1])
@@ -778,7 +799,7 @@ def main():
                     torch.save(alphas, f"{args.output_dir}/{epoch}_alphas.pt")
                     torch.cuda.empty_cache()
 
-                print(f"saving best alphas from validation step {best_epoch}, words = ", best_words)
+                print(f"saving best alphas from validation epoch {best_epoch}, words = ", best_words)
                 torch.save(best_alphas, f"{args.output_dir}/best_alphas.pt")
 
 
