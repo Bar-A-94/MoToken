@@ -264,7 +264,7 @@ def parse_args():
           "Run validation every X epochs. Validation consists of running the"
           " prompt `args.validation_prompt` multiple times:"
           " `args.num_validation_videos` and logging the videos."),)
-    parser.add_argument("--path_to_encoder_embeddings",
+    parser.add_argument("--path_to_encoder_embeddings", # TODO: Make sure it's the real embeddings
                         type=str,
                         default="./LB_text_encoding.pt",
                         help="Path to the saved embeddings matrix of the text encoder",)
@@ -307,7 +307,8 @@ class ConceptDataset(Dataset):
                 flip_p=0.5,
                 split="train",
                 placeholder_token="*",
-                center_crop=False,):
+                center_crop=False,
+                original_prompt="A dog walking"):
         self.data_root = data_root
         self.tokenizer = tokenizer
         self.width = width
@@ -315,6 +316,7 @@ class ConceptDataset(Dataset):
         self.placeholder_token = placeholder_token
         self.center_crop = center_crop
         self.flip_p = flip_p
+        self.original_prompt=original_prompt
 
         self.videos_paths = [os.path.join(self.data_root, file_path) for file_path in os.listdir(self.data_root)]
 
@@ -386,6 +388,11 @@ class ConceptDataset(Dataset):
                                                 max_length=self.tokenizer.model_max_length, 
                                                 return_tensors="pt",).input_ids[0]
         example["pixel_values"] = video_tensor
+        example['original_prompt'] = self.tokenizer(self.original_prompt,
+                                                padding="max_length",
+                                                truncation=True,
+                                                max_length=self.tokenizer.model_max_length, 
+                                                return_tensors="pt",).input_ids[0]
 
         return example
 
@@ -552,7 +559,8 @@ def main():
                                     placeholder_token=args.placeholder_token,
                                     repeats=args.repeats,
                                     center_crop=args.center_crop,
-                                    split="train",)
+                                    split="train",
+                                    original_prompt=args.prompt)
     train_dataloader = torch.utils.data.DataLoader(train_dataset,
                                                     batch_size=args.train_batch_size,
                                                     shuffle=True,
@@ -589,12 +597,10 @@ def main():
 
     print("***** Running training *****")
     print(f"  Num examples = {len(train_dataset)}")
-    print(f"  Num Epochs = {args.num_train_epochs}")
-    print(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    print(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
-    )
-    print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    print(f"  Total optimization steps = {args.max_train_steps}")
+    print(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    print("***** Arguments *****")
+    for arg, value in vars(args).items():
+        print(f"  {arg} = {value}")
 
     # keep original embeddings as reference
     orig_embeds_params = (
@@ -663,7 +669,7 @@ def main():
                 print(f"{i}: {alpha} * {token}")
 
             token_embeds[placeholder_token_id] = embedding
-            pipe.text_encoder.get_input_embeddings().weight.requires_grad_(True) # TODO: Why it's require grad? don't we need just the alpha?
+            # pipe.text_encoder.get_input_embeddings().weight.requires_grad_(True) # TODO: Why it's require grad? don't we need just the alpha?
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect() 
@@ -691,7 +697,55 @@ def main():
             gpu_status('After noise clean')
 
             # Get the text embedding for conditioning
-            encoder_hidden_states = pipe.text_encoder(batch["input_ids"])[0].to(dtype=weight_dtype)
+            encoder_hidden_states = pipe.text_encoder(batch["input_ids"])[0] # The 0 is for getting the last hidden state
+            original_encoder_state = pipe.text_encoder(batch["original_prompt"])[0]
+            ####### Check the difference between the encodings
+            # Step 1: Check the norm of each token embedding
+            # This helps us verify if there are any anomalies in the embedding magnitudes
+
+            # Compute L2 norm for each token embedding in both tensors
+            encoder_token_norms = torch.norm(encoder_hidden_states, p=2, dim=2)  # Shape: (3, 226)
+            original_token_norms = torch.norm(original_encoder_state, p=2, dim=2)  # Shape: (3, 226)
+
+            print("Encoder token norms (first example, first 5 tokens):")
+            print(encoder_token_norms[0, :5])
+            print("\nOriginal token norms (first example, first 5 tokens):")
+            print(original_token_norms[0, :5])
+
+            print("\nEncoder token norms stats:")
+            print(f"Min: {encoder_token_norms.min().item()}, Max: {encoder_token_norms.max().item()}, Mean: {encoder_token_norms.mean().item()}")
+            print("\nOriginal token norms stats:")
+            print(f"Min: {original_token_norms.min().item()}, Max: {original_token_norms.max().item()}, Mean: {original_token_norms.mean().item()}")
+
+            # Step 2: Check token-wise similarity at each position
+            # Normalize embeddings for cosine similarity
+            encoder_norm = F.normalize(encoder_hidden_states, p=2, dim=2)
+            original_norm = F.normalize(original_encoder_state, p=2, dim=2)
+
+            # Calculate per-token similarity
+            token_similarities = torch.sum(encoder_norm * original_norm, dim=2)  # Shape: (3, 226)
+
+            print("\nToken-wise similarities (first example, first 5 tokens):")
+            print(token_similarities[0, :5])
+            print("\nToken similarity stats:")
+            print(f"Min: {token_similarities.min().item()}, Max: {token_similarities.max().item()}, Mean: {token_similarities.mean().item()}")
+
+            # Step 3: Compute example-wise similarity (averaging across tokens)
+            example_similarities = token_similarities.mean(dim=1)  # Shape: (3)
+            print("\nExample-wise similarities (averaged across tokens):")
+            print(example_similarities)
+
+            # Step 4: Compute cross-batch similarities
+            batch_size = encoder_hidden_states.shape[0]
+            cross_batch_sims = torch.zeros(batch_size, batch_size)
+
+            for i in range(batch_size):
+                for j in range(batch_size):
+                    # Average token-wise similarities between examples i and j
+                    cross_batch_sims[i, j] = torch.sum(encoder_norm[i] * encoder_norm[j], dim=1).mean()
+
+            print("\nCross-batch similarities:")
+            print(cross_batch_sims)
             gpu_status('After Encoder')
 
 
@@ -711,11 +765,11 @@ def main():
                 raise ValueError("Unknown prediction type"
                 f" {pipe.scheduler.config.prediction_type}")
 
-            mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+            mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean") # TODO: Maybe mean reduction is not the best?
 
             top_indices = [sorted_indices[i].item() for i in range(args.num_explanation_tokens)]
             top_embedding = torch.matmul(alphas[top_indices], dictionary[top_indices])
-            sparsity_loss = 1 - torch.cosine_similarity(top_embedding.reshape(1, -1), embedding.reshape(1, -1))
+            sparsity_loss = 1 - torch.cosine_similarity(top_embedding.reshape(1, -1), embedding.reshape(1, -1)) #TODO: Understand why this is sparsity
 
             # calculate final loss
             loss = mse_loss + args.sparsity_coeff * sparsity_loss
@@ -754,7 +808,7 @@ def main():
                     video = pipe(
                                 width=720,
                                 height=480,
-                                prompt="A dog walking",  
+                                prompt=args.prompt,  
                                 num_videos_per_prompt=1,
                                 num_inference_steps=50,
                                 num_frames=81,
