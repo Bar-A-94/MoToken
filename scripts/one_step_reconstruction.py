@@ -324,7 +324,7 @@ class ConceptDataset(Dataset):
         self._length = self.num_videos
 
         if split == "train":
-            self._length = self.num_videos * repeats #TODO: Check what used for
+            self._length = self.num_videos * repeats 
 
         self.interpolation = {"linear": PIL_INTERPOLATION["linear"],
                                 "bilinear": PIL_INTERPOLATION["bilinear"],
@@ -364,11 +364,8 @@ class ConceptDataset(Dataset):
             # Process each frame as before
             img = np.array(image).astype(np.uint8)
 
-            if self.center_crop: # TODO: Shouldn't used, consider removing
-                crop = min(img.shape[0], img.shape[1])
-                h, w = img.shape[0], img.shape[1]
-                img = img[(h - crop) // 2 : (h + crop) // 2, 
-                            (w - crop) // 2 : (w + crop) // 2]
+            if self.center_crop: 
+                raise NotImplementedError("Center cropping is not implemented yet for video.") 
 
             image = Image.fromarray(img)
             image = image.resize((self.width, self.height), resample=self.interpolation)
@@ -466,7 +463,7 @@ def get_dictionary_indices(args, target_video_encodings, tokenizer, dictionary_s
         lb_concept_features = language_bind_model(inputs) 
 
         concept_words_similarity = torch.cosine_similarity(lb_concept_features['language'], normalized_text_encodings, axis=1)
-        similar_words = (np.array(concept_words_similarity.detach().cpu()) > 0.9).nonzero()[0] # TODO: Make sure it's the right threshold
+        similar_words = (np.array(concept_words_similarity.detach().cpu()) > 0.9).nonzero()[0] # TODO: Fix the threshold
         # Zero-out similar words
         for i in similar_words:
             print("removing similar word", tokenizer.decode(i))
@@ -497,6 +494,19 @@ class Net(nn.Module):
         x = self.fc2(x)
         return x.flatten().abs()
 
+def entropy_sparsity(alphas):
+    normalized = F.softmax(torch.abs(alphas), dim=0)
+    entropy = -torch.sum(normalized * torch.log(normalized + 1e-10))
+    return entropy
+
+def sorted_l1_penalty(alphas):
+    values, _ = torch.sort(torch.abs(alphas), descending=True)
+    weights = torch.arange(1, len(values) + 1, device=alphas.device).float()
+    weights = weights / weights.sum()
+    return (values * weights).sum()
+
+def differentiable_l0_norm(alphas, beta=100.0):
+    return torch.sigmoid(beta * torch.abs(alphas)).sum()
 
 def main(): 
     args = parse_args()
@@ -641,8 +651,23 @@ def main():
     validation_model = LBsimilarity() 
     num_words = args.dictionary_size
 
-
+    # with torch.no_grad():
+    #     generator = torch.Generator("cuda").manual_seed(args.validation_seed)
+    #     video = pipe(
+    #                 width=720,
+    #                 height=480,
+    #                 prompt="A dog walking",  
+    #                 num_videos_per_prompt=1,
+    #                 num_inference_steps=50,
+    #                 num_frames=81,
+    #                 use_dynamic_cfg=True,
+    #                 guidance_scale=6.0,
+    #                 generator=generator
+    #                 ).frames[0]
+        
     torch.cuda.empty_cache()
+    
+
 
     for epoch in range(args.num_train_epochs):
         net.train()
@@ -652,9 +677,8 @@ def main():
             pipe.text_encoder.get_input_embeddings().weight.detach_().requires_grad_(False)
 
             # calculate current embeddings
-            token_embeds = pipe.text_encoder.get_input_embeddings().weight
             alphas = net(dictionary) # Pass the embeddings of the encoder throw a net - each get a single number
-            _, sorted_indices = torch.sort(alphas.abs(), descending=True) # TODO: Understand why abs?
+            _, sorted_indices = torch.sort(alphas.abs(), descending=True) # Abs to get the most important token even negative
             print_words = min(50, args.num_explanation_tokens)
 
             word_indices = sorted_indices[:num_words]
@@ -662,14 +686,17 @@ def main():
             embedding = torch.mul(embedding, 1 / embedding.norm())
             embedding = torch.mul(embedding, avg_norm)
 
+
             top_words = [pipe.tokenizer.decode(dictionary_indices[sorted_indices[i]]) for i in range(print_words)]
             for i in range(print_words):
                 token = top_words[i]
                 alpha = alphas[sorted_indices[i]]
                 print(f"{i}: {alpha} * {token}")
+            
 
-            token_embeds[placeholder_token_id] = embedding
-            # pipe.text_encoder.get_input_embeddings().weight.requires_grad_(True) # TODO: Why it's require grad? don't we need just the alpha?
+            # Update embedding
+            pipe.text_encoder.get_input_embeddings().weight[placeholder_token_id] = embedding
+
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect() 
@@ -678,8 +705,9 @@ def main():
             latents = (pipe.vae.encode(batch["pixel_values"].to("cuda").contiguous().to(dtype=weight_dtype))
                         .latent_dist.sample()
                         .detach())
-            # latents = latents * vae.config.scaling_factor
-            latents = latents * 0.18215 # TODO: understand why we don't use decode_latents function
+            
+            # latents = latents * pipe.vae.config.scaling_factor # in cog vae config it's "scaling_factor": 0.7,
+            # latents = latents * 0.18215 # TODO: understand why we don't use decode_latents function
 
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
@@ -691,6 +719,7 @@ def main():
             # Add noise to the latents according to the noise magnitude at each
             # timestep (this is the forward diffusion process)
             noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps).permute(0, 2, 1, 3, 4)
+            noisy_latents = pipe.scheduler.scale_model_input(noisy_latents, timesteps) # added from the pipeline code
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect() 
@@ -698,68 +727,22 @@ def main():
 
             # Get the text embedding for conditioning
             encoder_hidden_states = pipe.text_encoder(batch["input_ids"])[0] # The 0 is for getting the last hidden state
-            original_encoder_state = pipe.text_encoder(batch["original_prompt"])[0]
-            ####### Check the difference between the encodings
-            # Step 1: Check the norm of each token embedding
-            # This helps us verify if there are any anomalies in the embedding magnitudes
 
-            # Compute L2 norm for each token embedding in both tensors
-            encoder_token_norms = torch.norm(encoder_hidden_states, p=2, dim=2)  # Shape: (3, 226)
-            original_token_norms = torch.norm(original_encoder_state, p=2, dim=2)  # Shape: (3, 226)
-
-            print("Encoder token norms (first example, first 5 tokens):")
-            print(encoder_token_norms[0, :5])
-            print("\nOriginal token norms (first example, first 5 tokens):")
-            print(original_token_norms[0, :5])
-
-            print("\nEncoder token norms stats:")
-            print(f"Min: {encoder_token_norms.min().item()}, Max: {encoder_token_norms.max().item()}, Mean: {encoder_token_norms.mean().item()}")
-            print("\nOriginal token norms stats:")
-            print(f"Min: {original_token_norms.min().item()}, Max: {original_token_norms.max().item()}, Mean: {original_token_norms.mean().item()}")
-
-            # Step 2: Check token-wise similarity at each position
-            # Normalize embeddings for cosine similarity
-            encoder_norm = F.normalize(encoder_hidden_states, p=2, dim=2)
-            original_norm = F.normalize(original_encoder_state, p=2, dim=2)
-
-            # Calculate per-token similarity
-            token_similarities = torch.sum(encoder_norm * original_norm, dim=2)  # Shape: (3, 226)
-
-            print("\nToken-wise similarities (first example, first 5 tokens):")
-            print(token_similarities[0, :5])
-            print("\nToken similarity stats:")
-            print(f"Min: {token_similarities.min().item()}, Max: {token_similarities.max().item()}, Mean: {token_similarities.mean().item()}")
-
-            # Step 3: Compute example-wise similarity (averaging across tokens)
-            example_similarities = token_similarities.mean(dim=1)  # Shape: (3)
-            print("\nExample-wise similarities (averaged across tokens):")
-            print(example_similarities)
-
-            # Step 4: Compute cross-batch similarities
-            batch_size = encoder_hidden_states.shape[0]
-            cross_batch_sims = torch.zeros(batch_size, batch_size)
-
-            for i in range(batch_size):
-                for j in range(batch_size):
-                    # Average token-wise similarities between examples i and j
-                    cross_batch_sims[i, j] = torch.sum(encoder_norm[i] * encoder_norm[j], dim=1).mean()
-
-            print("\nCross-batch similarities:")
-            print(cross_batch_sims)
             gpu_status('After Encoder')
 
-
+            # Add rotary embeddings
+            image_rotary_emb = pipe._prepare_rotary_positional_embeddings(args.resolution[0], args.resolution[1], latents.size(2), "cuda")
             # Predict the noise residual    
-            model_pred = pipe.transformer(noisy_latents, 
-                                            encoder_hidden_states, 
-                                            timesteps).sample.permute(0, 2, 1, 3, 4) 
+            model_pred = pipe.transformer(hidden_states=noisy_latents, 
+                                            encoder_hidden_states=encoder_hidden_states, 
+                                            timestep=timesteps,
+                                            image_rotary_emb=image_rotary_emb).sample.permute(0, 2, 1, 3, 4) 
             gpu_status('After Transformer')
 
-            # Get the target for loss depending on the prediction type
-            # TODO: Understand what is this section
+            # Get the target for loss depending on the prediction type (classic ddpm vs flow matching)
             if pipe.scheduler.config.prediction_type == "epsilon":
                 target = noise
-            elif pipe.scheduler.config.prediction_type == "v_prediction":
+            elif pipe.scheduler.config.prediction_type == "v_prediction": # Cog using flow matching
                 target = pipe.scheduler.get_velocity(latents, noise, timesteps)
             else:
                 raise ValueError("Unknown prediction type"
@@ -769,7 +752,11 @@ def main():
 
             top_indices = [sorted_indices[i].item() for i in range(args.num_explanation_tokens)]
             top_embedding = torch.matmul(alphas[top_indices], dictionary[top_indices])
-            sparsity_loss = 1 - torch.cosine_similarity(top_embedding.reshape(1, -1), embedding.reshape(1, -1)) #TODO: Understand why this is sparsity
+            # sparsity_loss = 1 - torch.cosine_similarity(top_embedding.reshape(1, -1), embedding.reshape(1, -1)) # This is not sparsity
+            # sparsity_loss = torch.norm(alphas, p=1) # l1 loss
+            # sparsity_loss = entropy_sparsity(alphas)
+            # sparsity_loss = differentiable_l0_norm(alphas)
+            sparsity_loss = sorted_l1_penalty(alphas)
 
             # calculate final loss
             loss = mse_loss + args.sparsity_coeff * sparsity_loss
@@ -791,7 +778,7 @@ def main():
             gpu_status("Done with batch")
 
             if (args.validation_prompt is not None and batch_num == 0):
-                token_embeds[placeholder_token_id] = top_embedding
+                # pipe.text_encoder.get_input_embeddings().weight[placeholder_token_id] = top_embedding # TODO: Check if necessary
                 print("Running validation... \n Generating"
                     f" {args.num_validation_videos} videos with prompt:"
                     f" {args.validation_prompt}.")
@@ -805,20 +792,6 @@ def main():
                     validation_dir = f"{args.output_dir}/validation/epoch_{epoch}"
                     validation_dir = Path(validation_dir)
                     validation_dir.mkdir(exist_ok=True, parents=True)
-                    video = pipe(
-                                width=720,
-                                height=480,
-                                prompt=args.prompt,  
-                                num_videos_per_prompt=1,
-                                num_inference_steps=50,
-                                num_frames=81,
-                                use_dynamic_cfg=True,
-                                guidance_scale=6.0,
-                                generator=generator
-                                ).frames[0]
-                    video_path = f"{validation_dir}/original.mp4"
-                    print(f"Video generated {video_path}")
-                    export_to_video(video, video_path, fps=16)
                     for i in range(args.num_validation_videos):
                         video = pipe(
                                 width=720,
