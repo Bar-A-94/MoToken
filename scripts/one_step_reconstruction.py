@@ -52,6 +52,7 @@ from diffusers import (
     CogVideoXDPMScheduler,
     CogVideoXPipeline,
 )
+from diffusers.pipelines.cogvideo.pipeline_cogvideox import retrieve_timesteps
 from diffusers import AutoencoderKLCogVideoX, CogVideoXTransformer3DModel, AutoencoderKLCogVideoX
 # from ...models import AutoencoderKLCogVideoX, CogVideoXTransformer3DModel
 from transformers import T5EncoderModel, T5Tokenizer
@@ -83,7 +84,10 @@ logger = get_logger(__name__)
 template = ["A dog {}"]
 
 
-def gpu_status(stage, print_gpu_status=False):
+def gpu_clean_and_status(stage, print_gpu_status=False):
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect() 
     if print_gpu_status:
         print("GPUs status for:", stage)
         for i in range(torch.cuda.device_count()):
@@ -127,7 +131,7 @@ def parse_args():
                         help="The concept to explain.",)
     parser.add_argument("--repeats",
                         type=int,
-                        default=5,
+                        default=1,
                         help="How many times to repeat the training data.",)
     parser.add_argument("--output_dir",
                         type=str,
@@ -264,7 +268,7 @@ def parse_args():
           "Run validation every X epochs. Validation consists of running the"
           " prompt `args.validation_prompt` multiple times:"
           " `args.num_validation_videos` and logging the videos."),)
-    parser.add_argument("--path_to_encoder_embeddings", # TODO: Make sure it's the real embeddings
+    parser.add_argument("--path_to_encoder_embeddings", 
                         type=str,
                         default="./LB_text_encoding.pt",
                         help="Path to the saved embeddings matrix of the text encoder",)
@@ -285,14 +289,6 @@ def parse_args():
         raise ValueError("You must specify a train data directory.")
 
     return args
-
-
-def decode_latents(vae, latents):
-    latents = 1 / 0.18215 * latents # TODO: Find the proper unscaling to replace 0.18215
-    image = vae.decode(latents).sample
-    image = (image / 2 + 0.5).clamp(0, 1) # TODO: Force from [-1,1] to [0,1] - Find out if needed
-    image = image.permute(0, 2, 3, 1) # (B, C, H, W) > (B, H, W, C)
-    return image
 
 
 class ConceptDataset(Dataset):
@@ -394,13 +390,12 @@ class ConceptDataset(Dataset):
         return example
 
 
-def get_language_bind_encodings(data_root, batch_size=100):
+def get_language_bind_encodings(data_root, device, batch_size=100):
     # Define the modalities to use with LanguageBind for video
     clip_type = {'video': 'LanguageBind_Video_FT'}
     
-    # Initialize the LanguageBind model with the given modalities and cache directory,
-    # and move it to the GPU ("cuda")
-    language_bind_model = LanguageBind(clip_type=clip_type, cache_dir='/home/joberant/NLP_2425a/baralon1/cache').to("cuda")
+    # Initialize the LanguageBind model with the given modalities and cache directory, and move it to the GPU (device)
+    language_bind_model = LanguageBind(clip_type=clip_type, cache_dir='/home/joberant/NLP_2425a/baralon1/cache').to(device)
     
     # Create a dictionary of transformation functions for each modality.
     # Each transform is created using the corresponding configuration from the model.
@@ -419,7 +414,7 @@ def get_language_bind_encodings(data_root, batch_size=100):
             # Get the batch of video paths.
             batch_paths = video_paths[i: i + batch_size]
             # Process the current batch using the video modality transform and move it to GPU.
-            inputs_batch = {'video': to_device(modality_transform['video'](batch_paths), "cuda")}
+            inputs_batch = {'video': to_device(modality_transform['video'](batch_paths), device)}
             # Get the encodings for the current batch.
             batch_encodings = language_bind_model(inputs_batch)['video']
             # Normalize each encoding vector (each row) to have unit norm.
@@ -442,9 +437,7 @@ def get_language_bind_encodings(data_root, batch_size=100):
     return target_video_encodings
 
 
-def get_dictionary_indices(args, target_video_encodings, tokenizer, dictionary_size):
-    
-
+def get_dictionary_indices(args, target_video_encodings, tokenizer, dictionary_size, device):
     normalized_text_encodings = torch.load(args.path_to_encoder_embeddings)
 
     # calculate cosine similarities for the average video
@@ -454,15 +447,23 @@ def get_dictionary_indices(args, target_video_encodings, tokenizer, dictionary_s
     if args.remove_concept_tokens:
         # === Remove concept tokens ===
         clip_type = {'video': 'LanguageBind_Video_FT'}
-        language_bind_model = LanguageBind(clip_type=clip_type, cache_dir='/home/ai_center/ai_users/arielshaulov/conceptor/cache').to("cuda")
+        language_bind_model = LanguageBind(clip_type=clip_type, cache_dir='/home/ai_center/ai_users/arielshaulov/conceptor/cache').to(device)
         language_bind_model.eval()
-        lb_concept_inputs = tokenizer([args.concept], padding=True, return_tensors="pt").to("cuda")
+        lb_concept_inputs = tokenizer([args.concept], padding=True, return_tensors="pt").to(device)
 
         inputs = {}
         inputs['language'] = lb_concept_inputs
         lb_concept_features = language_bind_model(inputs) 
 
         concept_words_similarity = torch.cosine_similarity(lb_concept_features['language'], normalized_text_encodings, axis=1)
+        # Print top words and their similarity values
+        topk = 5000  # You can change this number as desired
+        top_sim, top_idx = torch.topk(concept_words_similarity, topk)
+        # print("Top words and their cosine similarities:")
+        for counter, (sim, idx) in enumerate(zip(top_sim, top_idx)):
+            # Decode the token index; note that tokenizer.decode expects a list or tensor.
+            word = tokenizer.decode([int(idx)])
+            # print(f"{counter}: Word: -{word}- Token id:{int(idx)} Similarity: {sim.item():.4f}")        
         similar_words = (np.array(concept_words_similarity.detach().cpu()) > 0.9).nonzero()[0] # TODO: Fix the threshold
         # Zero-out similar words
         for i in similar_words:
@@ -494,10 +495,6 @@ class Net(nn.Module):
         x = self.fc2(x)
         return x.flatten().abs()
 
-def entropy_sparsity(alphas):
-    normalized = F.softmax(torch.abs(alphas), dim=0)
-    entropy = -torch.sum(normalized * torch.log(normalized + 1e-10))
-    return entropy
 
 def sorted_l1_penalty(alphas):
     values, _ = torch.sort(torch.abs(alphas), descending=True)
@@ -505,19 +502,28 @@ def sorted_l1_penalty(alphas):
     weights = weights / weights.sum()
     return (values * weights).sum()
 
-def differentiable_l0_norm(alphas, beta=100.0):
-    return torch.sigmoid(beta * torch.abs(alphas)).sum()
 
 def main(): 
     args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Suppress verbose logging output 
     transformers.utils.logging.set_verbosity_error()
     diffusers.utils.logging.set_verbosity_error()
+
+    # Load the pipe line
     pipe = CogVideoXPipeline.from_pretrained(args.pretrained_model_name_or_path, 
                                                 torch_dtype=torch.bfloat16, 
                                                 device_map="balanced")
     pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
+    pipe.vae.enable_slicing() # Enables channel-wise slicing - optimize memory usage
+    pipe.vae.enable_tiling() # splits the image into smaller tiles and processes each tile separately - optimize memory usage
+    pipe.set_progress_bar_config(disable=True)
     if args.gradient_checkpointing:
         pipe.transformer.enable_gradient_checkpointing()
+
+    weight_dtype = torch.bfloat16 # Check if needed
+
 
     # Add the placeholder token in tokenizer
     num_added_tokens = pipe.tokenizer.add_tokens(args.placeholder_token)
@@ -527,32 +533,21 @@ def main():
                             " the tokenizer.")
 
     placeholder_token_id = pipe.tokenizer.convert_tokens_to_ids(args.placeholder_token)
-    # Resize the token embeddings as we are adding new special tokens to the tokenizer
-    pipe.text_encoder.resize_token_embeddings(len(pipe.tokenizer))
+    pipe.text_encoder.resize_token_embeddings(len(pipe.tokenizer)) # Resize the token embeddings 
 
-    # Freeze vae and transformer
+    # Freeze  all parameters in pipeline
     pipe.vae.requires_grad_(False)
     pipe.transformer.requires_grad_(False)
-    # Freeze all parameters except for the token embeddings in text encoder
     pipe.text_encoder.encoder.requires_grad_(False)  # Freeze the entire encoder
     for param in pipe.text_encoder.encoder.block.parameters():
         param.requires_grad = False  # Freeze all encoder blocks
-
     pipe.text_encoder.encoder.final_layer_norm.requires_grad_(False)  # Freeze final layer norm (if exists)
     pipe.text_encoder.shared.requires_grad_(False)  # Freeze input token embeddings
+    pipe.text_encoder.get_input_embeddings().weight.requires_grad_(False)
 
 
-    if args.allow_tf32:
-        torch.backends.cuda.matmul.allow_tf32 = True
-
-    if args.scale_lr:
-        args.learning_rate = (args.learning_rate
-                                * args.gradient_accumulation_steps
-                                * args.train_batch_size)
-
-    # initialize nn
-    net = Net()
-    net.to(torch.bfloat16)
+    # Initialize net
+    net = Net().to(dtype=weight_dtype, device='cuda')
 
     # Initialize the optimizer - only optimize the embeddings
     optimizer = torch.optim.AdamW(net.parameters(),
@@ -576,83 +571,55 @@ def main():
                                                     shuffle=True,
                                                     num_workers=args.dataloader_num_workers,)
 
-    # Scheduler and math around the number of training steps.
-    overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps) 
-  
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        overrode_max_train_steps = True
 
     lr_scheduler = get_scheduler(args.lr_scheduler,
                                     optimizer=optimizer,
                                     num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-                                    num_training_steps=args.max_train_steps
-                                    * args.gradient_accumulation_steps,)
+                                    num_training_steps=len(train_dataloader) * args.num_train_epochs)
 
-
-    weight_dtype = torch.bfloat16 # Check if needed
-
-    # Move vae and transformer to device and cast to weight_dtype
-    net.to('cuda')
-
-    # We need to recalculate our total training steps as the size of the training
-    # dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-    total_batch_size = (args.train_batch_size * args.gradient_accumulation_steps)
-
+    # Print the arguments
     print("***** Running training *****")
     print(f"  Num examples = {len(train_dataset)}")
-    print(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     print("***** Arguments *****")
     for arg, value in vars(args).items():
         print(f"  {arg} = {value}")
 
     # keep original embeddings as reference
-    orig_embeds_params = (
-        pipe.text_encoder
-        .get_input_embeddings()
-        .weight.data.clone())
+    orig_embeds_params = (pipe.text_encoder.get_input_embeddings().weight.data.clone())
 
+    # Extract the average norm
     norms = [i.norm().item() for i in orig_embeds_params]
     avg_norm = np.mean(norms)
-    pipe.text_encoder.get_input_embeddings().weight.requires_grad_(False)
 
-    # get dictionary
-    num_tokens = args.dictionary_size
-    target_video_encodings = get_language_bind_encodings(args.train_data_dir)
-    validation_video_encodings = get_language_bind_encodings(args.validation_data_dir)
+    # Get dictionary
+    num_tokens = args.dictionary_size # The number of tokens in the game
 
-    dictionary_indices = get_dictionary_indices(args, target_video_encodings, pipe.tokenizer, num_tokens).to("cuda")
+    # Get video encoding for train and val
+    target_video_encodings = get_language_bind_encodings(args.train_data_dir, device)
+    validation_video_encodings = get_language_bind_encodings(args.validation_data_dir, device)
 
-    print("Saving dictionary")
+    # Find the most similar tokens to the video encodings
+    dictionary_indices = get_dictionary_indices(args, target_video_encodings, pipe.tokenizer, num_tokens, device).to(device)
     os.makedirs(args.output_dir, exist_ok=True)
     torch.save(dictionary_indices, f"{args.output_dir}/dictionary.pt")
 
+    # Make sure we don't track back gradients for the new tensors
     target_video_encodings.detach_().requires_grad_(False)
     validation_video_encodings.detach_().requires_grad_(False)
-    dictionary = orig_embeds_params[dictionary_indices]
-
-    pipe.vae.enable_slicing()
-    pipe.vae.enable_tiling()
-
-    gpu_status('After loading pipe to device')
-
-    pipe.set_progress_bar_config(disable=True)
+    dictionary = orig_embeds_params[dictionary_indices] # Make sure we didn't change anything
 
     best_validation_score = 0
     best_alphas = None
     best_epoch = None
     best_words = None
+    best_loss = 100000
+    best_train_words = None
+    best_train_alphas = None
     validation_model = LBsimilarity() 
-    num_words = args.dictionary_size
 
+    # Debug a normal inference
     # with torch.no_grad():
-    #     generator = torch.Generator("cuda").manual_seed(args.validation_seed)
+    #     generator = torch.Generator(device).manual_seed(args.validation_seed)
     #     video = pipe(
     #                 width=720,
     #                 height=480,
@@ -664,134 +631,151 @@ def main():
     #                 guidance_scale=6.0,
     #                 generator=generator
     #                 ).frames[0]
-        
-    torch.cuda.empty_cache()
-    
-
 
     for epoch in range(args.num_train_epochs):
         net.train()
         for batch_num, batch in tqdm(enumerate(train_dataloader), total=len(train_dataloader)):
-            print(f"Epoch: {epoch} batch_num: {batch_num}")
-            gpu_status('new batch!')
+            print(f"Epoch: {epoch} Batch_num: {batch_num}")
+            gpu_clean_and_status('New batch')
             pipe.text_encoder.get_input_embeddings().weight.detach_().requires_grad_(False)
 
-            # calculate current embeddings
+            # Calculate current embeddings
             alphas = net(dictionary) # Pass the embeddings of the encoder throw a net - each get a single number
             _, sorted_indices = torch.sort(alphas.abs(), descending=True) # Abs to get the most important token even negative
-            print_words = min(50, args.num_explanation_tokens)
+            print_words = args.num_explanation_tokens
 
-            word_indices = sorted_indices[:num_words]
-            embedding = torch.matmul(alphas[word_indices], dictionary[word_indices]) # Make an new embedding to assign to the new token
+            # Make the embbedings - take the full dictionary and make a new embedding then apply the known norm
+            embedding = torch.matmul(alphas[sorted_indices], dictionary[sorted_indices]) # Make an new embedding to assign to the new token
             embedding = torch.mul(embedding, 1 / embedding.norm())
             embedding = torch.mul(embedding, avg_norm)
-
-
-            top_words = [pipe.tokenizer.decode(dictionary_indices[sorted_indices[i]]) for i in range(print_words)]
-            for i in range(print_words):
-                token = top_words[i]
-                alpha = alphas[sorted_indices[i]]
-                print(f"{i}: {alpha} * {token}")
             
-
             # Update embedding
             pipe.text_encoder.get_input_embeddings().weight[placeholder_token_id] = embedding
 
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect() 
-            gpu_status('After Net clean')
-            # Convert videos to latent space
-            latents = (pipe.vae.encode(batch["pixel_values"].to("cuda").contiguous().to(dtype=weight_dtype))
-                        .latent_dist.sample()
-                        .detach())
+            # Print the top words for debuging
+            top_words = [pipe.tokenizer.decode(dictionary_indices[sorted_indices[i]]) for i in range(print_words)]
+            print(" | ".join([f"{i}: {alphas[sorted_indices[i]]} * <{top_words[i]}>" for i in range(print_words)]))            
+
             
-            # latents = latents * pipe.vae.config.scaling_factor # in cog vae config it's "scaling_factor": 0.7,
-            # latents = latents * 0.18215 # TODO: understand why we don't use decode_latents function
+            gpu_clean_and_status('After Net')
+
+            # Get the text embedding for conditioning
+            # encoder_hidden_states = pipe.text_encoder(batch["input_ids"])[0] # The 0 is for getting the last hidden state
+            prompt_embeds, negative_prompt_embeds = pipe.encode_prompt([args.validation_prompt]*args.train_batch_size,
+                                                                        None,
+                                                                        True,
+                                                                        num_videos_per_prompt=1,
+                                                                        prompt_embeds=None,
+                                                                        negative_prompt_embeds=None,
+                                                                        max_sequence_length=226,
+                                                                        device='cuda',)
+            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+            
+            gpu_clean_and_status('After Encoder')
+
+            # Sample a random timestep for each video
+            timesteps, num_inference_steps = retrieve_timesteps(pipe.scheduler, 50, 'cuda', None)
+            random_indices = torch.randint(0, len(timesteps), (1,), device=device)
+            timesteps = timesteps[random_indices]
+            
+            # Convert videos to latent space
+            latents = (pipe.vae.encode(batch["pixel_values"].to(device).contiguous().to(dtype=weight_dtype))
+                        .latent_dist.sample().detach())
 
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
-            bsz = latents.shape[0]
-            # Sample a random timestep for each video
-            timesteps = torch.randint(0, pipe.scheduler.config.num_train_timesteps, (bsz,), device=latents.device,)
-            timesteps = timesteps.long()
+        
+            # Add noise to the latents according to the noise magnitude at each timestep (this is the forward diffusion process)
+            noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps)
 
-            # Add noise to the latents according to the noise magnitude at each
-            # timestep (this is the forward diffusion process)
-            noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps).permute(0, 2, 1, 3, 4)
+            # Create rotary embeddings
+            image_rotary_emb = pipe._prepare_rotary_positional_embeddings(args.resolution[0], args.resolution[1], noisy_latents.size(2), device)
+
+            # Prepare noisy latents for uncondtion pred
+            noisy_latents = torch.cat([latents] * 2).permute(0, 2, 1, 3, 4)
             noisy_latents = pipe.scheduler.scale_model_input(noisy_latents, timesteps) # added from the pipeline code
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect() 
-            gpu_status('After noise clean')
+            
+            # Prepare timesteps to tranformer forward
+            timesteps = timesteps.expand(noisy_latents.shape[0])
 
-            # Get the text embedding for conditioning
-            encoder_hidden_states = pipe.text_encoder(batch["input_ids"])[0] # The 0 is for getting the last hidden state
-
-            gpu_status('After Encoder')
-
-            # Add rotary embeddings
-            image_rotary_emb = pipe._prepare_rotary_positional_embeddings(args.resolution[0], args.resolution[1], latents.size(2), "cuda")
-            # Predict the noise residual    
+            # Predict the noise residual
+            # model_pred = pipe.transformer(hidden_states=noisy_latents, 
+            #                                 encoder_hidden_states=prompt_embeds, 
+            #                                 timestep=timesteps,
+            #                                 image_rotary_emb=image_rotary_emb)[0].permute(0, 2, 1, 3, 4) 
+            
+            # Predict the noise residual
             model_pred = pipe.transformer(hidden_states=noisy_latents, 
-                                            encoder_hidden_states=encoder_hidden_states, 
+                                            encoder_hidden_states=prompt_embeds, 
                                             timestep=timesteps,
                                             image_rotary_emb=image_rotary_emb).sample.permute(0, 2, 1, 3, 4) 
-            gpu_status('After Transformer')
+            
+
+            model_pred = model_pred.float()
+            
+            # Handle guidance with uncoditioned
+            guidance_scale = 1 + 6 * (
+                        (1 - math.cos(math.pi * ((num_inference_steps - timesteps[0].item()) / num_inference_steps) ** 5.0)) / 2)
+            noise_pred_uncond, noise_pred_text = model_pred.chunk(2)
+            model_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            gpu_clean_and_status('After Transformer')
 
             # Get the target for loss depending on the prediction type (classic ddpm vs flow matching)
             if pipe.scheduler.config.prediction_type == "epsilon":
                 target = noise
             elif pipe.scheduler.config.prediction_type == "v_prediction": # Cog using flow matching
-                target = pipe.scheduler.get_velocity(latents, noise, timesteps)
+                target = pipe.scheduler.get_velocity(latents, noise, timesteps[:args.train_batch_size])
             else:
                 raise ValueError("Unknown prediction type"
                 f" {pipe.scheduler.config.prediction_type}")
 
-            mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean") # TODO: Maybe mean reduction is not the best?
+            mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
             top_indices = [sorted_indices[i].item() for i in range(args.num_explanation_tokens)]
-            top_embedding = torch.matmul(alphas[top_indices], dictionary[top_indices])
-            # sparsity_loss = 1 - torch.cosine_similarity(top_embedding.reshape(1, -1), embedding.reshape(1, -1)) # This is not sparsity
+            top_embedding = torch.matmul(alphas[top_indices], dictionary[top_indices]) # Now take only the top embbedings
+            top_embedding = torch.mul(top_embedding, 1 / top_embedding.norm())
+            top_embedding = torch.mul(top_embedding, avg_norm)
+
             # sparsity_loss = torch.norm(alphas, p=1) # l1 loss
-            # sparsity_loss = entropy_sparsity(alphas)
-            # sparsity_loss = differentiable_l0_norm(alphas)
             sparsity_loss = sorted_l1_penalty(alphas)
 
             # calculate final loss
             loss = mse_loss + args.sparsity_coeff * sparsity_loss
+            print(f"Total loss: {loss.item()} = MSE Loss: {mse_loss}, {args.sparsity_coeff} * Sparsity Loss: {sparsity_loss.item()}")
+
+            if loss < best_loss:
+                best_train_words = top_words
+                best_train_alphas = alphas
+                best_train_top_embedding = top_embedding
+                best_loss = loss
+                print('Best currently')
 
             loss.backward()
-
             optimizer.step()
-            lr_scheduler.step()
             optimizer.zero_grad()
+            lr_scheduler.step()
+
 
             # Let's make sure we don't update any embedding weights besides the newly added token
             index_no_updates = torch.arange(len(pipe.tokenizer)) != placeholder_token_id
             with torch.no_grad():
                 pipe.text_encoder.get_input_embeddings().weight[index_no_updates] = orig_embeds_params[index_no_updates]
-            print(f"Total loss: {loss.item()} = MSE Loss: {mse_loss}, {args.sparsity_coeff} * Sparsity Loss: {sparsity_loss.item()}")
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect() 
-            gpu_status("Done with batch")
+            gpu_clean_and_status("Done with batch")
 
-            if (args.validation_prompt is not None and batch_num == 0):
-                # pipe.text_encoder.get_input_embeddings().weight[placeholder_token_id] = top_embedding # TODO: Check if necessary
-                print("Running validation... \n Generating"
-                    f" {args.num_validation_videos} videos with prompt:"
-                    f" {args.validation_prompt}.")
+        if (args.validation_prompt):
+            with torch.no_grad():
+                validation_dir = f"{args.output_dir}/validation/epoch_{epoch}"
+                validation_dir = Path(validation_dir)
+                validation_dir.mkdir(exist_ok=True, parents=True)
+                for name, embedding in [("latest", top_embedding), ("best", best_train_top_embedding)]:
+                    pipe.text_encoder.get_input_embeddings().weight[placeholder_token_id] = embedding
+                    print("Running validation... \n Generating"
+                        f" {args.num_validation_videos} videos with prompt:"
+                        f" {args.validation_prompt} using {name} embeddings")
 
-                # run inference
-                generator = torch.Generator("cuda").manual_seed(args.validation_seed)
-                probabilities = []
-
-                with torch.no_grad():
-                    videos = []
-                    validation_dir = f"{args.output_dir}/validation/epoch_{epoch}"
-                    validation_dir = Path(validation_dir)
-                    validation_dir.mkdir(exist_ok=True, parents=True)
+                    # run inference
+                    generator = torch.Generator(device).manual_seed(args.validation_seed) # Create a deterministic random number generator 
+                    probabilities = []
                     for i in range(args.num_validation_videos):
                         video = pipe(
                                 width=720,
@@ -804,11 +788,12 @@ def main():
                                 guidance_scale=6.0,
                                 generator=generator
                                 ).frames[0]
-                        video_path = f"{validation_dir}/{i}.mp4"
+                        video_path = f"{validation_dir}/{name}_{i}.mp4"
                         print(f"Video generated {video_path}")
                         export_to_video(video, video_path, fps=16)
                         
                         probability = validation_model.get_probability(video_path, target_videos=validation_video_encodings[i : i + 1])
+                        # TODO: Check for mean instead of choosing
                         probabilities.append(probability.item())
 
                     validation_probability = np.mean(probabilities)
@@ -824,10 +809,8 @@ def main():
 
                     print("saving alphas from step: ", epoch)
                     torch.save(alphas, f"{args.output_dir}/{epoch}_alphas.pt")
-                    torch.cuda.empty_cache()
-
-                print(f"saving best alphas from validation epoch {best_epoch}, words = ", best_words)
-                torch.save(best_alphas, f"{args.output_dir}/best_alphas.pt")
+            print(f"saving best alphas from validation epoch {best_epoch}, words = ", best_words)
+            torch.save(best_alphas, f"{args.output_dir}/best_alphas.pt")
 
 
 if __name__ == "__main__":

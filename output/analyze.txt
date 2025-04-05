@@ -1,0 +1,9 @@
+timesteps_l1_1e_3 - good dogs, bad motion
+sorted_l1_1e_3 - epoch 2 is good, 0: 7.90625 * Walking, 1: 7.28125 * Walk, 2: 5.75 * Walk, 3: 5.03125 * weekend, 4: 4.53125 * dogs, 5: 4.4375 * Around 
+l1_1e_4 - no motion
+l1_1e_3 - epoch 2 is good 0: 1.7421875 * Speed, 1: 1.5 * speed, 2: 0.8359375 * pets, 3: 0.8203125 * wind
+normal_norm_top_sample_l1_1e_3 - good dogs, no motion
+normal_norm_top_no_sample_l1_1e_3 - bad
+normal_sorted_l1_1e_3 - 0: 96.0 * <Walking> | 1: 87.5 * <Walk> | 2: 74.5 * <Walk> | 3: 74.5 * <walk> | 4: 72.0 * <walking> | 5: 68.0 * <walk> | 6: 66.5 * <walks> | 7: 57.0 * <Licensed> | 8: 56.25 * <walked> | 9: 55.75 * <Walker> | 10: 55.5 * <walker> |
+normal_no_sample_sorted_l1_1e_3 - good 0: 70.5 * <walks> | 1: 69.5 * <Walk> | 2: 65.5 * <walk> | 3: 62.75 * <Walking> | 4: 59.75 * <Speed> | 5: 58.25 * <walking> | 6: 52.75 * <walk> | 7: 51.5 * <walked> | 8: 49.25 * <Speed> | 9: 46.25 * <Walk> | 10: 44.25 * <speed> | 
+ 
