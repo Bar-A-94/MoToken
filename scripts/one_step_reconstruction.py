@@ -699,16 +699,16 @@ def main():
             timesteps = timesteps.expand(noisy_latents.shape[0])
 
             # Predict the noise residual
-            # model_pred = pipe.transformer(hidden_states=noisy_latents, 
-            #                                 encoder_hidden_states=prompt_embeds, 
-            #                                 timestep=timesteps,
-            #                                 image_rotary_emb=image_rotary_emb)[0].permute(0, 2, 1, 3, 4) 
-            
-            # Predict the noise residual
             model_pred = pipe.transformer(hidden_states=noisy_latents, 
                                             encoder_hidden_states=prompt_embeds, 
                                             timestep=timesteps,
-                                            image_rotary_emb=image_rotary_emb).sample.permute(0, 2, 1, 3, 4) 
+                                            image_rotary_emb=image_rotary_emb)[0].permute(0, 2, 1, 3, 4) 
+            
+            # Predict the noise residual
+            # model_pred = pipe.transformer(hidden_states=noisy_latents, 
+            #                                 encoder_hidden_states=prompt_embeds, 
+            #                                 timestep=timesteps,
+            #                                 image_rotary_emb=image_rotary_emb).sample.permute(0, 2, 1, 3, 4) 
             
 
             model_pred = model_pred.float()
