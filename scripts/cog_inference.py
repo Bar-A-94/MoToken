@@ -11,7 +11,7 @@ pipe = CogVideoXPipeline.from_pretrained("THUDM/CogVideoX-5B",
 pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
 pipe.vae.enable_slicing()
 pipe.vae.enable_tiling()
-prompt = "A dog Rin"
+prompt = "A dog interested"
 with torch.no_grad():
     validation_dir = f"motoken/output/expirements/"
     validation_dir = Path(validation_dir)

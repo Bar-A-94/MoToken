@@ -29,7 +29,12 @@ import torch.backends.cudnn
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.enabled = True
 
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPModel, CLIPProcessor
+
+
 from accelerate.logging import get_logger
+from transformers import T5Tokenizer, T5EncoderModel
+
 import diffusers
 
 from diffusers.optimization import get_scheduler
@@ -158,7 +163,7 @@ def parse_args():
                         type=int,
                         default=2,
                         help="Batch size (per device) for the training dataloader.",)
-    parser.add_argument("--num_train_epochs", type=int, default=1000)
+    parser.add_argument("--num_train_epochs", type=int, default=10)
     parser.add_argument("--max_train_steps",
                         type=int,
                         default=10000,
@@ -457,14 +462,15 @@ def get_dictionary_indices(args, target_video_encodings, tokenizer, dictionary_s
 
         concept_words_similarity = torch.cosine_similarity(lb_concept_features['language'], normalized_text_encodings, axis=1)
         # Print top words and their similarity values
-        topk = 5000  # You can change this number as desired
+        topk = 30000 # You can change this number as desired
         top_sim, top_idx = torch.topk(concept_words_similarity, topk)
         # print("Top words and their cosine similarities:")
         for counter, (sim, idx) in enumerate(zip(top_sim, top_idx)):
             # Decode the token index; note that tokenizer.decode expects a list or tensor.
             word = tokenizer.decode([int(idx)])
-            # print(f"{counter}: Word: -{word}- Token id:{int(idx)} Similarity: {sim.item():.4f}")        
-        similar_words = (np.array(concept_words_similarity.detach().cpu()) > 0.9).nonzero()[0] # TODO: Fix the threshold
+            print(f"{counter}: Word: -{word}- Token id:{int(idx)} Similarity: {sim.item():.4f}")        
+        # similar_words = (np.array(concept_words_similarity.detach().cpu()) > 0.9).nonzero()[0] # TODO: Fix the threshold
+        similar_words = [10681, 1482,10801, 12539, 29873, 6412, 3214, 19525, 13521, 24063]
         # Zero-out similar words
         for i in similar_words:
             print("removing similar word", tokenizer.decode(i))
@@ -481,6 +487,45 @@ def get_dictionary_indices(args, target_video_encodings, tokenizer, dictionary_s
 
     # return the indices of the words to consider in the dictionary
     return sorted_indices[:dictionary_size]
+
+# def get_dictionary_indices(args, target_image_encodings, tokenizer, dictionary_size, device, pipe):
+#     # text_encoder_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+#     text_encoder_model = pipe.text_encoder
+
+#     normalized_text_encodings = torch.load(args.path_to_encoder_embeddings)
+
+#     # calculate cosine similarities for the average image
+#     # mean_target_image = target_image_encodings.mean(dim=0).reshape(1, -1)
+#     # cosine_similarities = torch.cosine_similarity(mean_target_image, normalized_text_encodings).reshape(1, -1)
+
+#     if args.remove_concept_tokens:
+#         # remove concept tokens
+#         concept_inputs = tokenizer([args.concept], padding=True, return_tensors="pt").to(device)
+#         output = text_encoder_model(**concept_inputs)
+#         concept_features = output.last_hidden_state.mean(dim=1)  # [1, D]
+#         concept_features = concept_features / concept_features.norm(dim=-1, keepdim=True)
+
+#         concept_words_similarity = torch.cosine_similarity(concept_features, normalized_text_encodings, axis=1)
+#         # Print top words and their similarity values
+#         topk = 5000  # You can change this number as desired
+#         top_sim, top_idx = torch.topk(concept_words_similarity, topk)
+#         # print("Top words and their cosine similarities:")
+#         for counter, (sim, idx) in enumerate(zip(top_sim, top_idx)):
+#             # Decode the token index; note that tokenizer.decode expects a list or tensor.
+#             word = tokenizer.decode([int(idx)])
+#             print(f"{counter}: Word: -{word}- Token id:{int(idx)} Similarity: {sim.item():.4f}")        
+#         similar_words = (np.array(concept_words_similarity.detach().cpu()) > 0.9).nonzero()[0]
+#         # Zero-out similar words
+#         for i in similar_words:
+#             print("removing similar word", tokenizer.decode(i))
+#         cosine_similarities[0, i] = 0
+
+#     # average similarities across the images
+#     mean_cosine = torch.mean(cosine_similarities, dim=0)
+#     _, sorted_indices = torch.sort(mean_cosine, descending=True)
+
+#     # return the indices of the words to consider in the dictionary
+#     return sorted_indices[:dictionary_size]
 
 
 class Net(nn.Module):
@@ -694,6 +739,10 @@ def main():
             # Prepare noisy latents for uncondtion pred
             noisy_latents = torch.cat([latents] * 2).permute(0, 2, 1, 3, 4)
             noisy_latents = pipe.scheduler.scale_model_input(noisy_latents, timesteps) # added from the pipeline code
+
+            # print(noisy_latents.shape)
+
+
             
             # Prepare timesteps to tranformer forward
             timesteps = timesteps.expand(noisy_latents.shape[0])
@@ -731,17 +780,62 @@ def main():
 
             mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-            top_indices = [sorted_indices[i].item() for i in range(args.num_explanation_tokens)]
-            top_embedding = torch.matmul(alphas[top_indices], dictionary[top_indices]) # Now take only the top embbedings
-            top_embedding = torch.mul(top_embedding, 1 / top_embedding.norm())
-            top_embedding = torch.mul(top_embedding, avg_norm)
+            ##############START CODE FOR MOTION LOSS#############################
+            unbatched = model_pred[0] 
+            latent_frames = unbatched.permute(1, 2, 3, 0) # shape: [21, 60, 104, 16]
+            frames, height, width, channels = latent_frames.shape
+
+            motion_frames = []
+            for frame_idx in range(1, frames):
+                current_frame = latent_frames[frame_idx, :, :, :]    # Shape: [60, 104, 16]
+                previous_frame = latent_frames[frame_idx - 1, :, :, :]  # Shape: [60, 104, 16]
+
+                motion_frame = torch.abs(current_frame - previous_frame)   # Shape: [60, 104, 16]
+                motion_frames.append(motion_frame)
+
+            pred_motion_frames_tensor = torch.stack(motion_frames, dim=0)  # Shape: [20, 60, 104, 16]
+            # pred_motion_variance_tensor = torch.var(motion_frames_tensor, dim=0, unbiased=False) # Shape: [60, 104, 16]
+            # pred_mean_motion_variance_tensor = motion_variance_tensor.mean(dim=-1)
+            # pred_motion_max_variance = torch.max(mean_motion_variance_tensor)
+
+
+            unbatched = latents[0] 
+            latent_frames = unbatched.permute(1, 2, 3, 0) # shape: [21, 60, 104, 16]
+
+            motion_frames = []
+            for frame_idx in range(1, frames):
+                current_frame = latent_frames[frame_idx, :, :, :]    # Shape: [60, 104, 16]
+                previous_frame = latent_frames[frame_idx - 1, :, :, :]  # Shape: [60, 104, 16]
+
+                motion_frame = torch.abs(current_frame - previous_frame)   # Shape: [60, 104, 16]
+                motion_frames.append(motion_frame)
+
+            original_motion_frames_tensor = torch.stack(motion_frames, dim=0)  # Shape: [20, 60, 104, 16]
+            # original_motion_variance_tensor = torch.var(motion_frames_tensor, dim=0, unbiased=False) # Shape: [60, 104, 16]
+            # original_mean_motion_variance_tensor = motion_variance_tensor.mean(dim=-1)
+            # original_motion_max_variance = torch.max(mean_motion_variance_tensor)
+
+            motion_loss = F.mse_loss(original_motion_frames_tensor.float(), pred_motion_frames_tensor.float(), reduction="mean")
+            motion_coeff = 5
+
+            ############## END CODE FOR MOTION LOSS#############################
+
+            
 
             # sparsity_loss = torch.norm(alphas, p=1) # l1 loss
             sparsity_loss = sorted_l1_penalty(alphas)
 
             # calculate final loss
-            loss = mse_loss + args.sparsity_coeff * sparsity_loss
-            print(f"Total loss: {loss.item()} = MSE Loss: {mse_loss}, {args.sparsity_coeff} * Sparsity Loss: {sparsity_loss.item()}")
+            loss = mse_loss + args.sparsity_coeff * sparsity_loss + motion_coeff * motion_loss
+
+            print(f"Total loss: {loss.item():.3f} = "
+                f"MSE Loss: {mse_loss:.3f}, "
+                f"{args.sparsity_coeff:.3f} * Sparsity Loss: {sparsity_loss.item():.3f}, "
+                f"{motion_coeff:.3f} * Motion Loss: {motion_loss:.3f}")
+            top_indices = [sorted_indices[i].item() for i in range(args.num_explanation_tokens)]
+            top_embedding = torch.matmul(alphas[top_indices], dictionary[top_indices]) # Now take only the top embbedings
+            top_embedding = torch.mul(top_embedding, 1 / top_embedding.norm())
+            top_embedding = torch.mul(top_embedding, avg_norm)
 
             if loss < best_loss:
                 best_train_words = top_words
@@ -749,6 +843,7 @@ def main():
                 best_train_top_embedding = top_embedding
                 best_loss = loss
                 print('Best currently')
+            
 
             loss.backward()
             optimizer.step()
