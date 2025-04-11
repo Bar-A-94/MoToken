@@ -66,6 +66,8 @@ models/**/*.bin
 models/**/*.pt
 models/languagebindmodel/
 data/LB_text_encoding.pt
+data/t5_cog_text_encoding.pt
+
 
 # File structure documentation
 file_structure.txt
