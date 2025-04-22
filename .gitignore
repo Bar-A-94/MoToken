@@ -73,3 +73,4 @@ data/t5_cog_text_encoding.pt
 file_structure.txt
 .DS_Store
 
+data/*.pt
