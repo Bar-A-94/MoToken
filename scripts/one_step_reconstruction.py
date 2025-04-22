@@ -445,6 +445,7 @@ def get_language_bind_encodings(data_root, device, batch_size=100):
     
     return target_video_encodings
 
+
 def get_dictionary_indices(args, text_encoder, tokenizer, dictionary_size, device):
     """
     Finds and prints the top-N most similar tokens in embedding space to the concept string.
@@ -475,52 +476,6 @@ def get_dictionary_indices(args, text_encoder, tokenizer, dictionary_size, devic
             print(f"{rank}: Word: -{word}- Token id:{int(idx)} Similarity: {sim.item():.4f}")
 
     return top_idx
-
-# def get_dictionary_indices(args, target_video_encodings, tokenizer, dictionary_size, device):
-#     normalized_text_encodings = torch.load(args.path_to_encoder_embeddings)
-
-#     if args.remove_concept_tokens:
-#         # === Remove concept tokens ===
-#         clip_type = {'video': 'LanguageBind_Video_FT'}
-#         language_bind_model = LanguageBind(clip_type=clip_type, cache_dir='/home/joberant/NLP_2425a/baralon1/cache').to(device)
-#         language_bind_model.eval()
-#         lb_concept_inputs = tokenizer([args.concept], padding=True, return_tensors="pt").to(device)
-
-#         inputs = {}
-#         inputs['language'] = lb_concept_inputs
-#         lb_concept_features = language_bind_model(inputs) 
-
-#         concept_words_similarity = torch.cosine_similarity(lb_concept_features['language'], normalized_text_encodings, axis=1)
-#         # Print top words and their similarity values
-#         topk = 30000 # You can change this number as desired
-#         top_sim, top_idx = torch.topk(concept_words_similarity, topk)
-#         # print("Top words and their cosine similarities:")
-#         for counter, (sim, idx) in enumerate(zip(top_sim, top_idx)):
-#             # Decode the token index; note that tokenizer.decode expects a list or tensor.
-#             word = tokenizer.decode([int(idx)])
-#             print(f"{counter}: Word: -{word}- Token id:{int(idx)} Similarity: {sim.item():.4f}")        
-#         # similar_words = (np.array(concept_words_similarity.detach().cpu()) > 0.9).nonzero()[0] # TODO: Fix the threshold
-#         # similar_words = [10681, 1482,10801, 12539, 29873, 6412, 3214, 19525, 13521, 24063]
-#         # Zero-out similar words
-#         # for i in similar_words:
-#         #     print("removing similar word", tokenizer.decode(i))
-#         #     cosine_similarities[0, i] = 0
-#         language_bind_model = language_bind_model.to("cpu")
-#         del language_bind_model
-#         import gc
-#         gc.collect()
-#         torch.cuda.empty_cache()
-
-#     # calculate cosine similarities for the average video
-#     mean_target_video = target_video_encodings.mean(dim=0).reshape(1, -1)
-#     cosine_similarities = torch.cosine_similarity(mean_target_video, normalized_text_encodings).reshape(1, -1)
-
-#     # Average similarities across the videos
-#     mean_cosine = torch.mean(cosine_similarities, dim=0)
-#     _, sorted_indices = torch.sort(mean_cosine, descending=True)
-
-#     # return the indices of the words to consider in the dictionary
-#     return sorted_indices[:dictionary_size]
 
 
 class Net(nn.Module):
@@ -588,7 +543,7 @@ def main():
 
 
     # Initialize net
-    net = Net().to(dtype=weight_dtype, device='cuda')
+    net = Net().to(dtype=weight_dtype, device=device)
     # Print a sanity check
     for name, param in net.named_parameters():
         print(f"{name}: requires_grad = {param.requires_grad}")
@@ -661,21 +616,6 @@ def main():
     best_train_alphas = None
     validation_model = LBsimilarity() 
 
-    # Debug a normal inference
-    # with torch.no_grad():
-    #     generator = torch.Generator(device).manual_seed(args.validation_seed)
-    #     video = pipe(
-    #                 width=720,
-    #                 height=480,
-    #                 prompt="A dog walking",  
-    #                 num_videos_per_prompt=1,
-    #                 num_inference_steps=50,
-    #                 num_frames=81,
-    #                 use_dynamic_cfg=True,
-    #                 guidance_scale=6.0,
-    #                 generator=generator
-    #                 ).frames[0]
-
     for epoch in range(args.num_train_epochs):
         net.train()
         for batch_num, batch in tqdm(enumerate(train_dataloader), total=len(train_dataloader)):
@@ -685,6 +625,8 @@ def main():
 
             # Calculate current embeddings
             alphas = net(dictionary) # Pass the embeddings of the encoder throw a net - each get a single number
+            alphas = torch.softmax(alphas, dim=0)
+
             _, sorted_indices = torch.sort(alphas.abs(), descending=True) # Abs to get the most important token even negative
             print_words = args.num_explanation_tokens
 
@@ -724,46 +666,38 @@ def main():
             
             # Convert videos to latent space
             latents = (pipe.vae.encode(batch["pixel_values"].to(device).contiguous().to(dtype=weight_dtype))
-                        .latent_dist.sample().detach())
+                        .latent_dist.sample().detach()).permute(0, 2, 1, 3, 4) # (B, C, F, H, W)
 
             # Sample noise that we'll add to the latents
-            noise = torch.randn_like(latents)
+            noise = torch.randn_like(latents) # (B, C, F, H, W)
         
             # Add noise to the latents according to the noise magnitude at each timestep (this is the forward diffusion process)
-            noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps)
+            noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps) # (B, C, F, H, W)
 
             # Create rotary embeddings
-            image_rotary_emb = pipe._prepare_rotary_positional_embeddings(args.resolution[0], args.resolution[1], noisy_latents.size(2), device)
+            image_rotary_emb = pipe._prepare_rotary_positional_embeddings(args.resolution[0], args.resolution[1], noisy_latents.size(1), device)
 
             # Prepare noisy latents for uncondtion pred
-            noisy_latents = torch.cat([latents] * 2).permute(0, 2, 1, 3, 4)
-            noisy_latents = pipe.scheduler.scale_model_input(noisy_latents, timesteps) # added from the pipeline code
+            noisy_latents_cat = torch.cat([latents] * 2) # (2 * B, C, F, H, W)
+            noisy_latents_cat = pipe.scheduler.scale_model_input(noisy_latents_cat, timesteps) # added from the pipeline code
             
             # Prepare timesteps to tranformer forward
-            timesteps = timesteps.expand(noisy_latents.shape[0])
+            timesteps = timesteps.expand(noisy_latents_cat.shape[0])
 
             gpu_clean_and_status("Before Transformer")
 
             # Predict the noise residual
-            model_pred = pipe.transformer(hidden_states=noisy_latents, 
+            model_pred = pipe.transformer(hidden_states=noisy_latents_cat, 
                                             encoder_hidden_states=prompt_embeds, 
                                             timestep=timesteps,
-                                            image_rotary_emb=image_rotary_emb)[0].permute(0, 2, 1, 3, 4) 
-            
-            # Predict the noise residual
-            # model_pred = pipe.transformer(hidden_states=noisy_latents, 
-            #                                 encoder_hidden_states=prompt_embeds, 
-            #                                 timestep=timesteps,
-            #                                 image_rotary_emb=image_rotary_emb).sample.permute(0, 2, 1, 3, 4) 
-            
+                                            image_rotary_emb=image_rotary_emb)[0] # (2 * B, C, F, H, W)
 
-            model_pred = model_pred.float()
+            model_pred = model_pred.float() # Taken from the pipeline
             
             # Handle guidance with uncoditioned
-            guidance_scale = 1 + 6 * (
-                        (1 - math.cos(math.pi * ((num_inference_steps - timesteps[0].item()) / num_inference_steps) ** 5.0)) / 2)
+            guidance_scale = 1 + 6 * ((1 - math.cos(math.pi * ((num_inference_steps - timesteps[0].item()) / num_inference_steps) ** 5.0)) / 2)
             noise_pred_uncond, noise_pred_text = model_pred.chunk(2)
-            model_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            model_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond) # (B, C, F, H, W)
             gpu_clean_and_status('After Transformer')
 
             # Get the target for loss depending on the prediction type (classic ddpm vs flow matching)
@@ -779,23 +713,23 @@ def main():
 
             ############## START CODE FOR MULTI‑SCALE MOTION LOSS (EXPLICIT) ################
 
-            # Permute to [B, T, H, W, C]
+            # Permute (B, C, F, H, W) to [B, F, H, W, C]
             pred_latents = model_pred.permute(0, 2, 3, 4, 1)
             orig_latents = latents.permute(0, 2, 3, 4, 1)
 
             # 1‑frame motion
-            pred_diff1 = torch.abs(pred_latents[:, 1:] - pred_latents[:, :-1])   # [B, T-1, H, W, C]
-            orig_diff1 = torch.abs(orig_latents[:, 1:] - orig_latents[:, :-1])   # [B, T-1, H, W, C]
+            pred_diff1 = torch.abs(pred_latents[:, 1:] - pred_latents[:, :-1])   # [B, F-1, H, W, C]
+            orig_diff1 = torch.abs(orig_latents[:, 1:] - orig_latents[:, :-1])   # [B, F-1, H, W, C]
             loss1     = F.mse_loss(pred_diff1.float(), orig_diff1.float(), reduction="mean")
 
             # 4‑frame motion
-            pred_diff4 = torch.abs(pred_latents[:, 4:] - pred_latents[:, :-4])   # [B, T-4, H, W, C]
-            orig_diff4 = torch.abs(orig_latents[:, 4:] - orig_latents[:, :-4])   # [B, T-4, H, W, C]
+            pred_diff4 = torch.abs(pred_latents[:, 4:] - pred_latents[:, :-4])   # [B, F-4, H, W, C]
+            orig_diff4 = torch.abs(orig_latents[:, 4:] - orig_latents[:, :-4])   # [B, F-4, H, W, C]
             loss4     = F.mse_loss(pred_diff4.float(), orig_diff4.float(), reduction="mean")
 
             # 8‑frame motion
-            pred_diff8 = torch.abs(pred_latents[:, 8:] - pred_latents[:, :-8])   # [B, T-8, H, W, C]
-            orig_diff8 = torch.abs(orig_latents[:, 8:] - orig_latents[:, :-8])   # [B, T-8, H, W, C]
+            pred_diff8 = torch.abs(pred_latents[:, 8:] - pred_latents[:, :-8])   # [B, F-8, H, W, C]
+            orig_diff8 = torch.abs(orig_latents[:, 8:] - orig_latents[:, :-8])   # [B, F-8, H, W, C]
             loss8     = F.mse_loss(pred_diff8.float(), orig_diff8.float(), reduction="mean")
 
             # Equal‑weight average across scales
@@ -803,8 +737,8 @@ def main():
 
             ############## END CODE FOR MULTI‑SCALE MOTION LOSS #############################
 
-            sparsity_loss = torch.norm(alphas, p=1) # l1 loss
-            # sparsity_loss = sorted_l1_penalty(alphas)
+            # sparsity_loss = torch.norm(alphas, p=1) # l1 loss
+            sparsity_loss = sorted_l1_penalty(alphas)
 
             # calculate final loss
             loss = mse_loss + args.sparsity_coeff * sparsity_loss + args.motion_coeff * motion_loss
@@ -837,6 +771,19 @@ def main():
             with torch.no_grad():
                 pipe.text_encoder.get_input_embeddings().weight[index_no_updates] = orig_embeds_params[index_no_updates]
             gpu_clean_and_status("Done with batch")
+
+            if batch_num % 5 == 0:
+                with torch.no_grad():
+                    training_dir = f"{args.output_dir}/training_dir/epoch_{epoch}"
+                    os.makedirs(training_dir, exist_ok=True)
+                    for latent, name in [(latents, "latents"), (noisy_latents, "noisy_latents"), (model_pred, "model_pred")]:
+                        latent = latent.to(torch.bfloat16)
+                        video = pipe.decode_latents(latent)
+                        video = pipe.video_processor.postprocess_video(video=video, output_type="pil")[0]
+                        video_path = f"{training_dir}/{batch_num}_{timesteps[0].item()}_{name}.mp4"
+                        export_to_video(video, video_path, fps=16)
+
+                        gpu_clean_and_status("Original video made")
 
         if (args.validation_prompt):
             with torch.no_grad():

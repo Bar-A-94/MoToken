@@ -11,7 +11,7 @@ pipe = CogVideoXPipeline.from_pretrained("THUDM/CogVideoX-5B",
 pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
 pipe.vae.enable_slicing()
 pipe.vae.enable_tiling()
-prompt = "A dog trekking"
+prompt = "A dog walking"
 with torch.no_grad():
     validation_dir = f"motoken/output/expirements/"
     validation_dir = Path(validation_dir)
@@ -26,7 +26,9 @@ with torch.no_grad():
             use_dynamic_cfg=True,
             guidance_scale=6.0,
             generator=generator
-            ).frames[0]
+            )
+    video = video.frames[0]
+
     video_path = f"{validation_dir}/{prompt}.mp4"
     print(f"Video generated {video_path}")
     export_to_video(video, video_path, fps=16)
