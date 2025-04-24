@@ -17,7 +17,6 @@
 # pylint: disable=g-multiple-import,g-importing-member,g-bad-import-order,missing-function-docstring,missing-class-docstring
 import argparse
 import glob
-import logging
 import math
 import os
 from pathlib import Path
@@ -29,11 +28,9 @@ import torch.backends.cudnn
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.enabled = True
 
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPModel, CLIPProcessor
 
 
 from accelerate.logging import get_logger
-from transformers import T5Tokenizer, T5EncoderModel
 
 import diffusers
 
@@ -58,9 +55,6 @@ from diffusers import (
     CogVideoXPipeline,
 )
 from diffusers.pipelines.cogvideo.pipeline_cogvideox import retrieve_timesteps
-from diffusers import AutoencoderKLCogVideoX, CogVideoXTransformer3DModel, AutoencoderKLCogVideoX
-# from ...models import AutoencoderKLCogVideoX, CogVideoXTransformer3DModel
-from transformers import T5EncoderModel, T5Tokenizer
 
 # Add the project root directory to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -177,11 +171,6 @@ def parse_args():
                         type=int,
                         default=50,
                         help="Number of words to produce as explanation.",)
-    parser.add_argument("--gradient_accumulation_steps",
-                        type=int,
-                        default=1,
-                        help=("Number of updates steps to accumulate before performing a"
-                                " backward/update pass."),)
     parser.add_argument("--gradient_checkpointing",
                         action="store_true", 
                         help=("Whether or not to use gradient checkpointing to save memory at the"
@@ -202,10 +191,6 @@ def parse_args():
                         type=float,
                         default=5,
                         help="Initial learning rate (after the potential warmup period) to use.",)
-    parser.add_argument("--scale_lr",
-                        action="store_true",
-                        default=False,
-                        help=("Scale the learning rate by the number of GPUs, gradient accumulation steps, and batch size."),)
     parser.add_argument("--lr_scheduler",
                         type=str,
                         default="constant",
@@ -243,23 +228,6 @@ def parse_args():
                         default="logs",
                         help=("[TensorBoard](https://www.tensorflow.org/tensorboard) log directory."
                             " Will default to *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."),)
-    parser.add_argument("--mixed_precision",
-                        type=str,
-                        default="fp16",
-                        choices=["no", "fp16", "bf16"],
-                        help=("Whether to use mixed precision. Choose"
-                                "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
-                                "and an Nvidia Ampere GPU."),)
-    parser.add_argument("--allow_tf32",
-                        action="store_true",
-                        help=("Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up"
-                            " training. For more information, see"
-                            " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"),)
-    parser.add_argument("--report_to",
-                        type=str,
-                        default="tensorboard",
-                        help=("The integration to report the results and logs to. Supported"
-                                ' platforms are `"tensorboard"` (default)'),)
     parser.add_argument("--validation_prompt",
                         type=str,
                         default=None,
@@ -271,12 +239,12 @@ def parse_args():
                         help=("Number of videos that should be generated during validation with"
                                 " `validation_prompt`."),)
     parser.add_argument("--validation_steps",
-      type=int,
-      default=50,
-      help=(
-          "Run validation every X epochs. Validation consists of running the"
-          " prompt `args.validation_prompt` multiple times:"
-          " `args.num_validation_videos` and logging the videos."),)
+                        type=int,
+                        default=50,
+                        help=(
+                            "Run validation every X epochs. Validation consists of running the"
+                            " prompt `args.validation_prompt` multiple times:"
+                            " `args.num_validation_videos` and logging the videos."),)
     parser.add_argument("--path_to_encoder_embeddings", 
                         type=str,
                         default="./LB_text_encoding.pt",
@@ -285,18 +253,12 @@ def parse_args():
                         type=int,
                         default=-1,
                         help="For distributed training: local_rank",)
-    parser.add_argument("--enable_xformers_memory_efficient_attention",
-                        action="store_true",
-                        help="Whether or not to use xformers.",)
+
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
-
-    if args.train_data_dir is None:
-        raise ValueError("You must specify a train data directory.")
-
     return args
 
 
@@ -465,7 +427,8 @@ def get_dictionary_indices(args, text_encoder, tokenizer, dictionary_size, devic
     # Compute cosine similarity
     cosine_sim = torch.matmul(concept_embedding, embedding_weight.T).squeeze(0)  # [vocab_size]
     # === Zero out similarities above threshold ===
-    # cosine_sim[cosine_sim > 0.21] = 0
+    # if args.remove_concept_tokens:
+        # cosine_sim[cosine_sim > 0.21] = 0
 
     top_sim, top_idx = torch.topk(cosine_sim, k=dictionary_size)
 
@@ -491,11 +454,17 @@ class Net(nn.Module):
         return x.flatten().abs()
 
 
-def sorted_l1_penalty(alphas):
+def sorted_l1_loss(alphas):
     values, _ = torch.sort(torch.abs(alphas), descending=True)
     weights = torch.arange(1, len(values) + 1, device=alphas.device).float()
     weights = weights / weights.sum()
     return (values * weights).sum()
+
+
+def motion_loss(pred_latents, orig_latents, frame_diff):
+    pred_diff = torch.abs(pred_latents[:, frame_diff:] - pred_latents[:, :-frame_diff])   # [B, F-diff, H, W, C]
+    orig_diff = torch.abs(orig_latents[:, frame_diff:] - orig_latents[:, :-frame_diff])   # [B, F-diff, H, W, C]
+    return F.mse_loss(pred_diff.float(), orig_diff.float(), reduction="mean")
 
 
 def main(): 
@@ -507,8 +476,9 @@ def main():
     diffusers.utils.logging.set_verbosity_error()
 
     # Load the pipe line
+    weight_dtype = torch.bfloat16
     pipe = CogVideoXPipeline.from_pretrained(args.pretrained_model_name_or_path, 
-                                                torch_dtype=torch.bfloat16, 
+                                                torch_dtype=weight_dtype, 
                                                 device_map="balanced")
     pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
     pipe.vae.enable_slicing() # Enables channel-wise slicing - optimize memory usage
@@ -518,7 +488,6 @@ def main():
         pipe.transformer.enable_gradient_checkpointing()
         pipe.vae.enable_gradient_checkpointing()
 
-    weight_dtype = torch.bfloat16 # Check if needed
 
 
     # Add the placeholder token in tokenizer
@@ -573,7 +542,7 @@ def main():
 
     lr_scheduler = get_scheduler(args.lr_scheduler,
                                     optimizer=optimizer,
-                                    num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+                                    num_warmup_steps=args.lr_warmup_steps,
                                     num_training_steps=len(train_dataloader) * args.num_train_epochs)
 
     # Print the arguments
@@ -593,8 +562,7 @@ def main():
     # Get dictionary
     num_tokens = args.dictionary_size # The number of tokens in the game
 
-    # Get video encoding for train and val
-    target_video_encodings = get_language_bind_encodings(args.train_data_dir, device)
+    # Get video encoding for  val
     validation_video_encodings = get_language_bind_encodings(args.validation_data_dir, device)
 
     # Find the most similar tokens to the video encodings
@@ -603,7 +571,6 @@ def main():
     torch.save(dictionary_indices, f"{args.output_dir}/dictionary.pt")
 
     # Make sure we don't track back gradients for the new tensors
-    target_video_encodings.detach_().requires_grad_(False)
     validation_video_encodings.detach_().requires_grad_(False)
     dictionary = orig_embeds_params[dictionary_indices] # Make sure we didn't change anything
 
@@ -620,7 +587,7 @@ def main():
         net.train()
         for batch_num, batch in tqdm(enumerate(train_dataloader), total=len(train_dataloader)):
             print(f"Epoch: {epoch} Batch_num: {batch_num}")
-            gpu_clean_and_status('New batch')
+            gpu_clean_and_status('New batch', print_gpu_status=args.print_gpu_status)
             pipe.text_encoder.get_input_embeddings().weight.detach_().requires_grad_(False)
 
             # Calculate current embeddings
@@ -643,7 +610,7 @@ def main():
             print(" | ".join([f"{i}: {alphas[sorted_indices[i]]} * <{top_words[i]}>" for i in range(print_words)]))            
 
             
-            gpu_clean_and_status('After Net')
+            gpu_clean_and_status('After Net', print_gpu_status=args.print_gpu_status)
 
             # Get the text embedding for conditioning
             # encoder_hidden_states = pipe.text_encoder(batch["input_ids"])[0] # The 0 is for getting the last hidden state
@@ -657,7 +624,7 @@ def main():
                                                                         device='cuda',)
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
             
-            gpu_clean_and_status('After Encoder')
+            gpu_clean_and_status('After Encoder', print_gpu_status=args.print_gpu_status)
 
             # Sample a random timestep for each video
             timesteps, num_inference_steps = retrieve_timesteps(pipe.scheduler, 50, 'cuda', None)
@@ -666,39 +633,41 @@ def main():
             
             # Convert videos to latent space
             latents = (pipe.vae.encode(batch["pixel_values"].to(device).contiguous().to(dtype=weight_dtype))
-                        .latent_dist.sample().detach()).permute(0, 2, 1, 3, 4) # (B, C, F, H, W)
+                        .latent_dist.sample().detach()).permute(0, 2, 1, 3, 4) # (B, C, F, H, W) -> (B, F, C, H, W)
+            
+            # latents = pipe.vae_scaling_factor_image * latents
 
             # Sample noise that we'll add to the latents
-            noise = torch.randn_like(latents) # (B, C, F, H, W)
+            noise = torch.randn_like(latents) # (B, F, C, H, W)
         
             # Add noise to the latents according to the noise magnitude at each timestep (this is the forward diffusion process)
-            noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps) # (B, C, F, H, W)
+            noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps) # (B, F, C, H, W)
 
             # Create rotary embeddings
             image_rotary_emb = pipe._prepare_rotary_positional_embeddings(args.resolution[0], args.resolution[1], noisy_latents.size(1), device)
 
             # Prepare noisy latents for uncondtion pred
-            noisy_latents_cat = torch.cat([latents] * 2) # (2 * B, C, F, H, W)
+            noisy_latents_cat = torch.cat([latents] * 2) # (2 * B, F, C, H, W)
             noisy_latents_cat = pipe.scheduler.scale_model_input(noisy_latents_cat, timesteps) # added from the pipeline code
             
             # Prepare timesteps to tranformer forward
             timesteps = timesteps.expand(noisy_latents_cat.shape[0])
 
-            gpu_clean_and_status("Before Transformer")
+            gpu_clean_and_status("Before Transformer", print_gpu_status=args.print_gpu_status)
 
             # Predict the noise residual
             model_pred = pipe.transformer(hidden_states=noisy_latents_cat, 
                                             encoder_hidden_states=prompt_embeds, 
                                             timestep=timesteps,
-                                            image_rotary_emb=image_rotary_emb)[0] # (2 * B, C, F, H, W)
+                                            image_rotary_emb=image_rotary_emb)[0] # (2 * B, F, C, H, W)
 
             model_pred = model_pred.float() # Taken from the pipeline
             
             # Handle guidance with uncoditioned
             guidance_scale = 1 + 6 * ((1 - math.cos(math.pi * ((num_inference_steps - timesteps[0].item()) / num_inference_steps) ** 5.0)) / 2)
             noise_pred_uncond, noise_pred_text = model_pred.chunk(2)
-            model_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond) # (B, C, F, H, W)
-            gpu_clean_and_status('After Transformer')
+            model_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond) # (B, F, C, H, W)
+            gpu_clean_and_status('After Transformer', print_gpu_status=args.print_gpu_status)
 
             # Get the target for loss depending on the prediction type (classic ddpm vs flow matching)
             if pipe.scheduler.config.prediction_type == "epsilon":
@@ -713,40 +682,29 @@ def main():
 
             ############## START CODE FOR MULTI‑SCALE MOTION LOSS (EXPLICIT) ################
 
-            # Permute (B, C, F, H, W) to [B, F, H, W, C]
-            pred_latents = model_pred.permute(0, 2, 3, 4, 1)
-            orig_latents = latents.permute(0, 2, 3, 4, 1)
+            # Permute (B, F, C, H, W) to [B, F, H, W, C]
+            pred_latents = model_pred.permute(0, 1, 3, 4, 2)
+            orig_latents = latents.permute(0, 1, 3, 4, 2)
 
-            # 1‑frame motion
-            pred_diff1 = torch.abs(pred_latents[:, 1:] - pred_latents[:, :-1])   # [B, F-1, H, W, C]
-            orig_diff1 = torch.abs(orig_latents[:, 1:] - orig_latents[:, :-1])   # [B, F-1, H, W, C]
-            loss1     = F.mse_loss(pred_diff1.float(), orig_diff1.float(), reduction="mean")
+            loss1 = motion_loss(pred_latents, orig_latents, 1)
+            loss4 = motion_loss(pred_latents, orig_latents, 4)
+            loss8 = motion_loss(pred_latents, orig_latents, 8)
 
-            # 4‑frame motion
-            pred_diff4 = torch.abs(pred_latents[:, 4:] - pred_latents[:, :-4])   # [B, F-4, H, W, C]
-            orig_diff4 = torch.abs(orig_latents[:, 4:] - orig_latents[:, :-4])   # [B, F-4, H, W, C]
-            loss4     = F.mse_loss(pred_diff4.float(), orig_diff4.float(), reduction="mean")
-
-            # 8‑frame motion
-            pred_diff8 = torch.abs(pred_latents[:, 8:] - pred_latents[:, :-8])   # [B, F-8, H, W, C]
-            orig_diff8 = torch.abs(orig_latents[:, 8:] - orig_latents[:, :-8])   # [B, F-8, H, W, C]
-            loss8     = F.mse_loss(pred_diff8.float(), orig_diff8.float(), reduction="mean")
-
-            # Equal‑weight average across scales
-            motion_loss = (loss1 + loss4 + loss8)
+            # Equal‑weight across scales
+            total_motion_loss = (loss1 + loss4 + loss8)
 
             ############## END CODE FOR MULTI‑SCALE MOTION LOSS #############################
 
             # sparsity_loss = torch.norm(alphas, p=1) # l1 loss
-            sparsity_loss = sorted_l1_penalty(alphas)
+            sparsity_loss = sorted_l1_loss(alphas)
 
             # calculate final loss
-            loss = mse_loss + args.sparsity_coeff * sparsity_loss + args.motion_coeff * motion_loss
+            loss = mse_loss + args.sparsity_coeff * sparsity_loss + args.motion_coeff * total_motion_loss
 
             print(f"Total loss: {loss.item():.3f} = "
                 f"MSE Loss: {mse_loss:.3f}, "
                 f"{args.sparsity_coeff:.3f} * Sparsity Loss: {sparsity_loss.item():.3f}, "
-                f"{args.motion_coeff:.3f} * Motion Loss: {motion_loss:.3f}")
+                f"{args.motion_coeff:.3f} * Motion Loss: {total_motion_loss:.3f}")
             top_indices = [sorted_indices[i].item() for i in range(args.num_explanation_tokens)]
             top_embedding = torch.matmul(alphas[top_indices], dictionary[top_indices]) # Now take only the top embbedings
             top_embedding = torch.mul(top_embedding, 1 / top_embedding.norm())
@@ -770,20 +728,20 @@ def main():
             index_no_updates = torch.arange(len(pipe.tokenizer)) != placeholder_token_id
             with torch.no_grad():
                 pipe.text_encoder.get_input_embeddings().weight[index_no_updates] = orig_embeds_params[index_no_updates]
-            gpu_clean_and_status("Done with batch")
+            gpu_clean_and_status("Done with batch", print_gpu_status=args.print_gpu_status)
 
             if batch_num % 5 == 0:
                 with torch.no_grad():
                     training_dir = f"{args.output_dir}/training_dir/epoch_{epoch}"
                     os.makedirs(training_dir, exist_ok=True)
                     for latent, name in [(latents, "latents"), (noisy_latents, "noisy_latents"), (model_pred, "model_pred")]:
-                        latent = latent.to(torch.bfloat16)
+                        latent = latent.to(weight_dtype)
                         video = pipe.decode_latents(latent)
                         video = pipe.video_processor.postprocess_video(video=video, output_type="pil")[0]
                         video_path = f"{training_dir}/{batch_num}_{timesteps[0].item()}_{name}.mp4"
                         export_to_video(video, video_path, fps=16)
 
-                        gpu_clean_and_status("Original video made")
+                        gpu_clean_and_status(f"Video from {name} made", print_gpu_status=args.print_gpu_status)
 
         if (args.validation_prompt):
             with torch.no_grad():
