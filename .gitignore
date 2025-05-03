@@ -67,6 +67,8 @@ models/**/*.pt
 models/languagebindmodel/
 data/LB_text_encoding.pt
 data/t5_cog_text_encoding.pt
+scripts/plot_diff.py
+
 
 
 # File structure documentation
